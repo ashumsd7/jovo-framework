@@ -16,11 +16,14 @@ export interface RouteMatch {
 }
 
 export class RoutingExecutor {
-  private convertHandlerMetadataToRouteMatch = (path: string[]) => (metadata: HandlerMetadata) => ({
-    path,
-    metadata,
-    subState: metadata.options?.subState,
-  });
+  private convertHandlerMetadataToRouteMatch: (
+    path: string[],
+  ) => (metadata: HandlerMetadata) => RouteMatch =
+    (path: string[]) => (metadata: HandlerMetadata) => ({
+      path,
+      metadata,
+      subState: metadata.options?.subState,
+    });
 
   constructor(readonly handleRequest: HandleRequest, readonly jovo: Jovo) {}
 
@@ -44,12 +47,30 @@ export class RoutingExecutor {
   }
 
   getRouteMatches(intentName: string): RouteMatch[] {
-    if (!this.jovo.$state) {
-      return this.getGlobalRouteMatches(intentName);
+    return this.jovo.$state
+      ? this.getStatefulRouteMatches(intentName, this.jovo.$state)
+      : this.getStatelessRouteMatches(intentName);
+  }
+
+  private getStatelessRouteMatches(intentName: string): RouteMatch[] {
+    let routeMatches = this.getGlobalRouteMatches(intentName);
+    if (!routeMatches.length) {
+      routeMatches = this.getGlobalRouteMatches(InternalIntent.Unhandled);
     }
-    let routeMatches = this.getRouteMatchesInState(intentName, this.jovo.$state);
+    return routeMatches;
+  }
+
+  // Can be improved in the future by looking for UNHANDLED in the first loop as well.
+  private getStatefulRouteMatches(intentName: string, state: StateStack): RouteMatch[] {
+    let routeMatches = this.getLocalRouteMatches(intentName, state);
     if (!routeMatches.length) {
       routeMatches = this.getGlobalRouteMatches(intentName);
+    }
+    if (!routeMatches.length) {
+      routeMatches = this.getLocalRouteMatches(InternalIntent.Unhandled, state);
+    }
+    if (!routeMatches.length) {
+      routeMatches = this.getGlobalRouteMatches(InternalIntent.Unhandled);
     }
     return routeMatches;
   }
@@ -101,15 +122,23 @@ export class RoutingExecutor {
       );
   }
 
-  private getGlobalRouteMatches(intentName: string): RouteMatch[] {
-    let routeMatches = this.collectGlobalRouteMatches(intentName);
-    if (!routeMatches.length) {
-      routeMatches = this.collectGlobalRouteMatches(InternalIntent.Unhandled);
-    }
-    return routeMatches;
+  private getInputFilteredHandlerMetadata(
+    componentMetadata: ComponentMetadata,
+    intentName: string,
+    subState?: string,
+  ): HandlerMetadata[] {
+    return MetadataStorage.getInstance()
+      .getMergedHandlerMetadataOfComponent(componentMetadata.target)
+      .filter(
+        (metadata) =>
+          (subState ? metadata.options?.subState === subState : !metadata.options?.subState) &&
+          this.getMappedIntentNames(metadata.intentNames, intentName).includes(intentName) &&
+          (!metadata.options?.platforms?.length ||
+            metadata.options?.platforms?.includes(this.jovo.$platform.constructor.name)),
+      );
   }
 
-  private collectGlobalRouteMatches(intentName: string): RouteMatch[] {
+  private getGlobalRouteMatches(intentName: string): RouteMatch[] {
     return this.collectGlobalRouteMatchesOfComponents(this.handleRequest.components, intentName);
   }
 
@@ -145,23 +174,8 @@ export class RoutingExecutor {
     return matches;
   }
 
-  private getInputFilteredHandlerMetadata(
-    componentMetadata: ComponentMetadata,
-    intentName: string,
-    subState?: string,
-  ): HandlerMetadata[] {
-    return MetadataStorage.getInstance()
-      .getMergedHandlerMetadataOfComponent(componentMetadata.target)
-      .filter(
-        (metadata) =>
-          (subState ? metadata.options?.subState === subState : !metadata.options?.subState) &&
-          this.getMappedIntentNames(metadata.intentNames, intentName).includes(intentName) &&
-          (!metadata.options?.platforms?.length ||
-            metadata.options?.platforms?.includes(this.jovo.$platform.constructor.name)),
-      );
-  }
-
-  private getRouteMatchesInState(intentName: string, state: StateStack): RouteMatch[] {
+  // Searches in latest component in stack and traverses it's parents until matches were found or the root is reached.
+  private getLocalRouteMatches(intentName: string, state: StateStack): RouteMatch[] {
     const latestStateStackItem = state[state.length - 1];
     const currentPath = latestStateStackItem.componentPath.split('.');
 
@@ -189,14 +203,8 @@ export class RoutingExecutor {
       intentName,
       subState,
     );
-    if (!relatedHandlerMetadata.length) {
-      relatedHandlerMetadata = this.getInputFilteredHandlerMetadata(
-        componentMetadata,
-        InternalIntent.Unhandled,
-        subState,
-      );
-    }
-    // if nothing was found and subState is set, look in the same component without subState
+
+    // If nothing was found and subState is set, look in the same component without subState.
     if (!relatedHandlerMetadata.length && subState) {
       relatedHandlerMetadata = this.getMatchingHandlerMetadata(componentMetadata, intentName);
     }
